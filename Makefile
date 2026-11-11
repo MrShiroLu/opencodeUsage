@@ -26,7 +26,7 @@ print: build
 
 render: build
 	OCMETER_DEMO=1 OCMETER_RENDER=docs/preview.png $(BIN)
-	OCMETER_RENDER=docs/welcome.png OCMETER_WELCOME=1 $(BIN)
+	OCMETER_DEMO=1 OCMETER_RENDER=docs/welcome.png OCMETER_WELCOME=1 $(BIN)
 
 clean:
 	rm -rf build

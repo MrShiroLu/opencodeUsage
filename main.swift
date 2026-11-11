@@ -342,6 +342,14 @@ func compact(_ value: Int) -> String {
     }
 }
 
+func grouped(_ value: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.groupingSeparator = ","
+    formatter.usesGroupingSeparator = true
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
 func currency(_ value: Double) -> String {
     if value > 0 && value < 0.01 { return "<$0.01" }
     return String(format: "$%.2f", value)
@@ -1084,10 +1092,10 @@ struct MeterView: View {
 
     private func statRow(_ snapshot: Snapshot) -> some View {
         HStack(spacing: 0) {
-            StatChip(value: "\(snapshot.sessions)", label: "sessions")
-            StatChip(value: compact(snapshot.steps), label: "steps")
-            StatChip(value: "\(snapshot.prompts)", label: "prompts")
-            StatChip(value: "\(snapshot.toolCalls)", label: "tools")
+            StatChip(value: grouped(snapshot.sessions), label: "sessions")
+            StatChip(value: grouped(snapshot.steps), label: "steps")
+            StatChip(value: grouped(snapshot.prompts), label: "prompts")
+            StatChip(value: grouped(snapshot.toolCalls), label: "tools")
         }
         .padding(.vertical, 8)
         .background(
@@ -1454,34 +1462,69 @@ extension AppDelegate {
 
 // MARK: - Entry point
 
+/// Fixed sample data for the README screenshots, so the published images do not
+/// contain real usage numbers.
+func demoSnapshot() -> Snapshot {
+    var snapshot = Snapshot()
+    snapshot.cost = 18.42
+    snapshot.input = 12_480_000
+    snapshot.output = 486_000
+    snapshot.reasoning = 312_000
+    snapshot.cacheRead = 38_900_000
+    snapshot.cacheWrite = 2_310_000
+    snapshot.sessions = 128
+    snapshot.subagents = 34
+    snapshot.prompts = 942
+    snapshot.steps = 5_120
+    snapshot.activeDays = 24
+    snapshot.streak = 6
+    snapshot.toolCalls = 3_891
+    snapshot.toolFailed = 12
+    snapshot.models = [
+        ModelRow(name: "sonnet-4.5 · anthropic", tokens: 5_600_000, cost: 8.90, steps: 2_104),
+        ModelRow(name: "gpt-5.1-codex · openai", tokens: 4_400_000, cost: 5.70, steps: 1_780),
+        ModelRow(name: "gemini-3-pro · google", tokens: 3_200_000, cost: 3.82, steps: 1_236),
+    ]
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    let pattern = [142, 96, 18, 230, 174, 355, 261, 188, 112, 343, 199, 57, 220, 131]
+    snapshot.activity = (0..<14).compactMap { offset in
+        guard let date = Calendar.current.date(byAdding: .day, value: offset - 13, to: Date()) else {
+            return nil
+        }
+        return DayActivity(date: formatter.string(from: date), steps: pattern[offset])
+    }
+    return snapshot
+}
+
+func demoLimits() -> UsageLimits {
+    let now = Date()
+    return UsageLimits(
+        windows: [
+            UsageWindow(id: "rolling", title: "5 hours", percent: 42, limited: false,
+                        resetsAt: now.addingTimeInterval(2 * 3_600 + 40 * 60)),
+            UsageWindow(id: "weekly", title: "Week", percent: 84, limited: false,
+                        resetsAt: now.addingTimeInterval(4 * 86_400 + 12 * 3_600)),
+            UsageWindow(id: "monthly", title: "Month", percent: 31, limited: false,
+                        resetsAt: now.addingTimeInterval(21 * 86_400 + 5 * 3_600)),
+        ],
+        dashboardURL: URL(string: "https://opencode.ai")
+    )
+}
+
 @MainActor
 func renderPreview(to path: String) -> Int32 {
     let renderModel = MeterModel()
-    var loaded: Snapshot?
-    if let binary = findOpenCode(), case .success(let snapshot) = runStats(binary: binary, period: .week) {
-        loaded = snapshot
-    }
-    if ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1", var demo = loaded {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        let pattern = [42, 96, 18, 130, 74, 155, 61, 88, 12, 143, 99, 57, 120, 31]
-        demo.activity = (0..<14).compactMap { offset in
-            guard let date = Calendar.current.date(byAdding: .day, value: offset - 13, to: Date()) else { return nil }
-            return DayActivity(date: formatter.string(from: date), steps: pattern[offset])
-        }
-        loaded = demo
-    }
-    if let snapshot = loaded {
+    if ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1" {
+        renderModel.preview(demoSnapshot(), period: .month, limits: demoLimits())
+    } else if let binary = findOpenCode(),
+              case .success(let snapshot) = runStats(binary: binary, period: .week) {
         let limits: UsageLimits? = {
-            guard let binary = findOpenCode(),
-                  case .success(let limits) = fetchLimits(binary: binary) else { return nil }
+            guard case .success(let limits) = fetchLimits(binary: binary) else { return nil }
             return limits
         }()
-        renderModel.preview(
-            snapshot,
-            period: ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1" ? .month : .week,
-            limits: limits
-        )
+        renderModel.preview(snapshot, period: .week, limits: limits)
     }
     if ProcessInfo.processInfo.environment["OCMETER_WELCOME"] == "1" {
         renderModel.showWelcome = true
