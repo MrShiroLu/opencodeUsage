@@ -60,7 +60,7 @@ ok "Swift toolchain: $(swiftc --version 2>/dev/null | head -1 | cut -c1-50)"
 if command -v opencode >/dev/null 2>&1; then
   ok "OpenCode CLI: $(command -v opencode)"
 else
-  printf '\033[0;33m  !\033[0m OpenCode CLI not found — the app installs anyway and tells you in the welcome screen.\n'
+  printf '\033[0;33m  !\033[0m OpenCode CLI not found. The app installs anyway; the welcome screen points you to it.\n'
 fi
 
 # --- 1. build -----------------------------------------------------------------
@@ -88,13 +88,13 @@ answer="$(ask "Launch $APP_NAME when you log in? [y/N] " "N")"
 if [[ "$answer" =~ ^[yY]$ ]]; then
   ./Support/install-login-item.sh "$TARGET"
 else
-  ok "Skipped — you can add it later with ./Support/install-login-item.sh"
+  ok "Skipped. Add it later with ./Support/install-login-item.sh"
 fi
 
 # --- 4. onboarding reset (optional) --------------------------------------------
 if [[ "$FRESH" == "1" ]]; then
   defaults delete "$BUNDLE_ID" 2>/dev/null || true
-  ok "Onboarding reset — the welcome screen will appear"
+  ok "Onboarding reset. The welcome screen will appear."
 fi
 
 # --- 5. launch ------------------------------------------------------------------
@@ -103,7 +103,7 @@ open "$TARGET"
 ok "$APP_NAME is now in your menu bar"
 
 if [[ "$FRESH" == "1" ]]; then
-  printf '\n\033[0;32mDone!\033[0m Click the menu bar icon — the "Get started" screen is waiting.\n'
+  printf '\n\033[0;32mDone!\033[0m Click the menu bar icon; the "Get started" screen is waiting.\n'
 else
-  printf '\n\033[0;32mDone!\033[0m First time? Click the menu bar icon to meet the "Get started" screen.\n'
+  printf '\n\033[0;32mDone!\033[0m First time? Click the menu bar icon for the "Get started" screen.\n'
 fi
