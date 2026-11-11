@@ -1,6 +1,10 @@
-# OpenCode Meter
+<p align="center">
+  <img src="docs/icon.png" width="128" alt="OpenCode Meter icon">
+</p>
 
-A small menu bar app for macOS that shows your [OpenCode](https://opencode.ai) usage.
+<h1 align="center">OpenCode Meter</h1>
+
+<p align="center">Your <a href="https://opencode.ai">OpenCode</a> usage, quotas and token totals in the menu bar.</p>
 
 It reads `opencode stats --json` and the local usage limits endpoint. No account, no API key, no telemetry, no network calls beyond your own OpenCode server. Everything stays on your Mac.
 
@@ -80,6 +84,7 @@ make build          # compile and ad-hoc sign into build/OpenCodeMeter.app
 make run            # build and launch
 make print          # one stats snapshot, no UI
 make render         # regenerate docs/*.png from the live design
+make icon           # regenerate docs/icon.png
 make uninstall      # remove ~/Applications/OpenCodeMeter.app
 ```
 
