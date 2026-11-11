@@ -440,7 +440,16 @@ final class MeterModel: ObservableObject {
 
         let requested = period
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = runStats(binary: binary, period: requested)
+            var result = runStats(binary: binary, period: requested)
+            // The activity chart always shows the last seven days, but
+            // `--days 1` only contains today. Pull the week too so Today's
+            // chart does not show six empty days.
+            if requested == .today,
+               case .success(var snapshot) = result,
+               case .success(let week) = runStats(binary: binary, period: .week) {
+                snapshot.activity = week.activity
+                result = .success(snapshot)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard requested == self.period else {
@@ -1046,10 +1055,10 @@ struct MeterView: View {
             VStack(alignment: .leading, spacing: 14) {
                 tokenCard(snapshot)
 
-                let series = paddedActivity(snapshot)
-                if series.filter({ $0.steps > 0 }).count >= 2 {
-                    ActivityChart(days: series)
-                }
+                // Always reserve the chart slot. Hiding it on sparse periods made
+                // the popover change height between Today and 30 days, which read
+                // as the panel opening and closing on every switch.
+                ActivityChart(days: paddedActivity(snapshot))
 
                 if !snapshot.models.isEmpty {
                     modelSection(snapshot)
