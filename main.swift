@@ -377,7 +377,7 @@ final class MeterModel: ObservableObject {
         didSet {
             guard !isPreviewing else { return }
             UserDefaults.standard.set(period.rawValue, forKey: "period")
-            resetAndLoad()
+            loadSelectedPeriod()
         }
     }
     @Published var displayMode: DisplayMode {
@@ -394,6 +394,7 @@ final class MeterModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private var pendingRefresh = false
     private var isPreviewing = false
+    private var snapshotCache: [Period: Snapshot] = [:]
     private var lastLimitsFetch: Date?
     private var isLoadingLimits = false
     private let binary = findOpenCode()
@@ -453,6 +454,7 @@ final class MeterModel: ObservableObject {
                 self.isLoading = false
                 switch result {
                 case .success(let snapshot):
+                    self.snapshotCache[requested] = snapshot
                     self.snapshot = snapshot
                     self.error = nil
                 case .failure(let error):
@@ -464,9 +466,15 @@ final class MeterModel: ObservableObject {
         }
     }
 
-    private func resetAndLoad() {
-        snapshot = nil
+    /// Switches periods without emptying the panel. A cached snapshot for the
+    /// period is shown immediately; otherwise the current snapshot stays in
+    /// place until the new stats arrive. Clearing `snapshot` here used to
+    /// collapse the whole popover and look like it was closing and reopening.
+    private func loadSelectedPeriod() {
         error = nil
+        if let cached = snapshotCache[period] {
+            snapshot = cached
+        }
         onChange?()
         refresh()
     }
@@ -780,7 +788,10 @@ private struct SegmentedControl: View {
             ForEach(Period.allCases, id: \.self) { option in
                 let active = option == selection
                 Button {
-                    withAnimation(.easeOut(duration: 0.16)) { selection = option }
+                    // Do not wrap this in `withAnimation`: the binding mutation
+                    // drives a stats reload, and animating that transaction made
+                    // the whole dashboard shrink and grow on every period switch.
+                    selection = option
                 } label: {
                     Text(option.shortLabel)
                         .font(.system(size: 10, weight: .medium))
@@ -793,6 +804,7 @@ private struct SegmentedControl: View {
                             RoundedRectangle(cornerRadius: 5, style: .continuous)
                                 .fill(active ? Color.primary.opacity(0.09) : Color.clear)
                         )
+                        .animation(.easeOut(duration: 0.16), value: active)
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity)
@@ -1411,6 +1423,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard fitting.height > 0 else { return }
         let available = (NSScreen.main?.visibleFrame.height ?? 900) - 40
         let height = min(max(fitting.height, 260), max(available, 320))
+        // Setting the same size still makes AppKit reposition the popover, which
+        // shows up as a jump. Only resize when the content really changed.
+        guard abs(popover.contentSize.height - height) > 0.5 else { return }
         popover.contentSize = NSSize(width: 336, height: height)
     }
 
