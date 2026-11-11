@@ -12,7 +12,7 @@ It reads `opencode stats --json` and the local usage limits endpoint. No account
 ## Features
 
 - **Limits on top**: 5 hour, weekly and monthly quota usage with reset countdown
-- **Menu bar**: token count, or a single emoji if you prefer a quiet icon
+- **Menu bar**: token count, or just the app mark if you prefer a quiet icon
 - **Dashboard**: cost, token split (input, output, reasoning, cache)
 - **Models**: top three models by token share
 - **Activity**: 14 day chart with value and date axes
@@ -46,7 +46,7 @@ Click the menu bar item to open the dashboard.
 | Control | What it does |
 | --- | --- |
 | Help | Opens the welcome screen |
-| Tokens / Emoji | Switches what the menu bar shows |
+| Tokens / Logo | Switches what the menu bar shows |
 | Refresh | Reloads stats and limits now |
 | Quit | Closes the app |
 

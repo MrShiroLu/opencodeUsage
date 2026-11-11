@@ -39,12 +39,12 @@ enum Period: Int, CaseIterable, Hashable {
 // MARK: - Display mode
 
 enum DisplayMode: String, CaseIterable, Hashable {
-    case tokens, emoji
+    case tokens, logo
 
     var label: String {
         switch self {
         case .tokens: return "Tokens"
-        case .emoji: return "Emoji"
+        case .logo: return "Logo"
         }
     }
 
@@ -393,6 +393,8 @@ final class MeterModel: ObservableObject {
     init() {
         period = Period(rawValue: defaults.object(forKey: "period") as? Int ?? 0) ?? .today
         displayMode = DisplayMode(rawValue: defaults.string(forKey: "displayMode") ?? "") ?? .tokens
+        // Earlier builds stored "emoji" for the icon-only mode.
+        if defaults.string(forKey: "displayMode") == "emoji" { displayMode = .logo }
         showWelcome = !defaults.bool(forKey: "hasOnboarded")
     }
 
@@ -945,9 +947,9 @@ struct MeterView: View {
             }
 
             ActionPill(
-                symbol: "menubar.rectangle",
+                symbol: "chevron.left.forwardslash.chevron.right",
                 label: model.displayMode.shortLabel,
-                active: model.displayMode == .emoji,
+                active: model.displayMode == .logo,
                 help: "Change what the menu bar shows"
             ) {
                 cycleDisplayMode()
@@ -999,7 +1001,7 @@ struct MeterView: View {
     }
 
     private func cycleDisplayMode() {
-        model.displayMode = model.displayMode == .tokens ? .emoji : .tokens
+        model.displayMode = model.displayMode == .tokens ? .logo : .tokens
     }
 
     private var headlineBlock: some View {
@@ -1322,6 +1324,7 @@ struct WelcomeView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var chartImage: NSImage!
+    private var logoImage: NSImage!
     private var popover: NSPopover!
     private var model = MeterModel()
     private var host: NSHostingController<MeterView>!
@@ -1333,6 +1336,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         chartImage = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "OpenCode usage")
         chartImage?.isTemplate = true
+        let logoConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        logoImage = NSImage(
+            systemSymbolName: "chevron.left.forwardslash.chevron.right",
+            accessibilityDescription: "OpenCode Meter"
+        )?.withSymbolConfiguration(logoConfig)
+        logoImage?.isTemplate = true
         if let button = statusItem.button {
             button.image = chartImage
             button.imagePosition = .imageLeading
@@ -1371,14 +1380,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         switch model.displayMode {
         case .tokens:
+            button.attributedTitle = NSAttributedString(string: "")
             button.image = chartImage
             setTitle(compact(snapshot.totalTokens))
-        case .emoji:
-            button.image = nil
-            button.attributedTitle = NSAttributedString(
-                string: "📊",
-                attributes: [.font: NSFont.systemFont(ofSize: 13)]
-            )
+        case .logo:
+            button.attributedTitle = NSAttributedString(string: "")
+            button.image = logoImage
         }
     }
 
