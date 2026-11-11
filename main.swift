@@ -39,15 +39,16 @@ enum Period: Int, CaseIterable, Hashable {
 // MARK: - Display mode
 
 enum DisplayMode: String, CaseIterable, Hashable {
-    case auto, cost, tokens
+    case tokens, emoji
 
     var label: String {
         switch self {
-        case .auto: return "Automatic"
-        case .cost: return "Cost"
         case .tokens: return "Tokens"
+        case .emoji: return "Emoji"
         }
     }
+
+    var shortLabel: String { label }
 }
 
 // MARK: - Snapshot
@@ -64,6 +65,19 @@ struct DayActivity: Identifiable {
     var id: String { date }
     let date: String
     let steps: Int
+}
+
+struct UsageWindow: Identifiable {
+    let id: String
+    let title: String
+    let percent: Int
+    let limited: Bool
+    let resetsAt: Date
+}
+
+struct UsageLimits {
+    var windows: [UsageWindow] = []
+    var dashboardURL: URL?
 }
 
 struct Snapshot {
@@ -230,6 +244,79 @@ func runStats(binary: String, period: Period) -> Result<Snapshot, Error> {
     return .success(snapshot)
 }
 
+func fetchLimits(binary: String) -> Result<UsageLimits, Error> {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: binary)
+    process.arguments = ["api", "get", "/api/experimental/usage/limits"]
+
+    var environment = ProcessInfo.processInfo.environment
+    let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    environment["PATH"] = (extraPaths + [environment["PATH"] ?? ""]).joined(separator: ":")
+    process.environment = environment
+
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+
+    do {
+        try process.run()
+    } catch {
+        return .failure(StatsError.failed(error.localizedDescription))
+    }
+
+    let watchdog = DispatchWorkItem {
+        if process.isRunning { process.terminate() }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: watchdog)
+
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    watchdog.cancel()
+
+    guard process.terminationStatus == 0 else {
+        let message = String(decoding: errorData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return .failure(StatsError.failed(message.isEmpty ? "usage limits unavailable" : message))
+    }
+
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let root = object as? [String: Any],
+          let payload = root["data"] as? [String: Any] else {
+        return .failure(StatsError.failed("unexpected limits response"))
+    }
+
+    var limits = UsageLimits()
+    if let workspace = payload["workspace"] as? [String: Any],
+       let urlString = workspace["usageURL"] as? String {
+        limits.dashboardURL = URL(string: urlString)
+    }
+
+    if let go = payload["go"] as? [String: Any] {
+        let windows: [(String, String, String)] = [
+            ("rolling", "5 hours", "rolling"),
+            ("weekly", "Week", "weekly"),
+            ("monthly", "Month", "monthly"),
+        ]
+        for (key, title, id) in windows {
+            guard let entry = go[key] as? [String: Any] else { continue }
+            let resetsAt = Date(timeIntervalSince1970: number(entry["resetsAt"]) / 1000)
+            limits.windows.append(
+                UsageWindow(
+                    id: id,
+                    title: title,
+                    percent: int(entry["percent"]),
+                    limited: (entry["limited"] as? Bool) ?? false,
+                    resetsAt: resetsAt
+                )
+            )
+        }
+    }
+
+    return .success(limits)
+}
+
 func int(_ value: Any?) -> Int {
     if let n = value as? NSNumber { return n.intValue }
     if let s = value as? String, let n = Int(s) { return n }
@@ -260,10 +347,21 @@ func currency(_ value: Double) -> String {
     return String(format: "$%.2f", value)
 }
 
+func countdown(to date: Date) -> String {
+    let seconds = max(0, Int(date.timeIntervalSinceNow))
+    let days = seconds / 86_400
+    let hours = (seconds % 86_400) / 3_600
+    let minutes = (seconds % 3_600) / 60
+    if days > 0 { return "\(days)d \(hours)h" }
+    if hours > 0 { return "\(hours)h \(minutes)m" }
+    return "\(minutes)m"
+}
+
 // MARK: - Model
 
 final class MeterModel: ObservableObject {
     @Published private(set) var snapshot: Snapshot?
+    @Published private(set) var limits: UsageLimits?
     @Published private(set) var error: String?
     @Published private(set) var isLoading = false
     @Published private(set) var lastUpdate: Date?
@@ -288,11 +386,13 @@ final class MeterModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private var pendingRefresh = false
     private var isPreviewing = false
+    private var lastLimitsFetch: Date?
+    private var isLoadingLimits = false
     private let binary = findOpenCode()
 
     init() {
         period = Period(rawValue: defaults.object(forKey: "period") as? Int ?? 0) ?? .today
-        displayMode = DisplayMode(rawValue: defaults.string(forKey: "displayMode") ?? "auto") ?? .auto
+        displayMode = DisplayMode(rawValue: defaults.string(forKey: "displayMode") ?? "") ?? .tokens
         showWelcome = !defaults.bool(forKey: "hasOnboarded")
     }
 
@@ -325,6 +425,7 @@ final class MeterModel: ObservableObject {
         }
         isLoading = true
         onChange?()
+        refreshLimits()
 
         let requested = period
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -360,13 +461,34 @@ final class MeterModel: ObservableObject {
         refresh()
     }
 
+    func refreshLimits(force: Bool = false) {
+        guard let binary else { return }
+        if !force, let last = lastLimitsFetch, Date().timeIntervalSince(last) < 300 { return }
+        if isLoadingLimits { return }
+        isLoadingLimits = true
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = fetchLimits(binary: binary)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoadingLimits = false
+                self.lastLimitsFetch = Date()
+                if case .success(let limits) = result, !limits.windows.isEmpty {
+                    self.limits = limits
+                }
+                self.onChange?()
+            }
+        }
+    }
+
     /// Used by the offscreen render harness so the design can be checked without a screen recording.
-    func preview(_ snapshot: Snapshot, period: Period = .week) {
+    func preview(_ snapshot: Snapshot, period: Period = .week, limits: UsageLimits? = nil) {
         isPreviewing = true
         self.period = period
         isPreviewing = false
         self.snapshot = snapshot
         self.error = nil
+        self.limits = limits
         self.lastUpdate = Date()
     }
 }
@@ -433,57 +555,155 @@ struct ActivityChart: View {
         return formatter
     }()
 
+    private static let axisFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter
+    }()
+
     private func weekday(for date: String) -> String {
         guard let parsed = Self.dayFormatter.date(from: date) else { return "" }
         return Self.weekdayFormatter.string(from: parsed)
     }
 
+    private func axisDate(for date: String) -> String {
+        guard let parsed = Self.dayFormatter.date(from: date) else { return date }
+        return Self.axisFormatter.string(from: parsed)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionLabel(text: "Daily steps")
+            HStack(spacing: 4) {
+                SectionLabel(text: "Daily steps")
+                Spacer()
+                Text("total \(compact(days.map(\.steps).reduce(0, +)))")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.quaternary)
+            }
 
-            GeometryReader { geo in
-                let visible = Array(days.suffix(14))
-                let gap: CGFloat = 4
-                let slot = (geo.size.width - gap * CGFloat(max(visible.count - 1, 0))) / CGFloat(max(visible.count, 1))
-                let barWidth = min(max(slot, 2), 16)
-                let chartHeight = geo.size.height - 10
+            HStack(spacing: 5) {
+                // Y axis
+                VStack(spacing: 0) {
+                    Text(compact(maxSteps))
+                        .font(.system(size: 7, weight: .medium))
+                        .foregroundStyle(.quaternary)
+                        .frame(height: 7, alignment: .top)
+                    Spacer(minLength: 0)
+                    Text("0")
+                        .font(.system(size: 7, weight: .medium))
+                        .foregroundStyle(.quaternary)
+                        .frame(height: 7, alignment: .bottom)
+                }
+                .frame(width: 16)
 
-                HStack(alignment: .bottom, spacing: gap) {
-                    ForEach(Array(visible.enumerated()), id: \.element.id) { index, day in
-                        let isLast = index == visible.count - 1
-                        let ratio = Double(day.steps) / Double(maxSteps)
-                        let height = day.steps == 0 ? 2 : max(3, chartHeight * CGFloat(ratio))
-                        VStack(spacing: 3) {
-                            Spacer(minLength: 0)
-                            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                                .fill(
-                                    day.steps == 0
-                                        ? AnyShapeStyle(Color.primary.opacity(0.08))
-                                        : AnyShapeStyle(
-                                            LinearGradient(
-                                                colors: [
-                                                    accent.opacity(isLast ? 0.95 : 0.7),
-                                                    accent.opacity(isLast ? 0.6 : 0.35),
-                                                ],
-                                                startPoint: .top,
-                                                endPoint: .bottom
-                                            )
+                GeometryReader { geo in
+                    let visible = Array(days.suffix(14))
+                    let gap: CGFloat = 4
+                    let slot = (geo.size.width - gap * CGFloat(max(visible.count - 1, 0))) / CGFloat(max(visible.count, 1))
+                    let barWidth = min(max(slot, 2), 16)
+
+                    ZStack(alignment: .bottomLeading) {
+                        // baseline
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.10))
+                            .frame(height: 0.5)
+
+                        HStack(alignment: .bottom, spacing: gap) {
+                            ForEach(Array(visible.enumerated()), id: \.element.id) { index, day in
+                                let isLast = index == visible.count - 1
+                                let ratio = Double(day.steps) / Double(maxSteps)
+                                let height = day.steps == 0 ? 2 : max(3, (geo.size.height - 8) * CGFloat(ratio))
+                                VStack(spacing: 3) {
+                                    Spacer(minLength: 0)
+                                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                        .fill(
+                                            day.steps == 0
+                                                ? AnyShapeStyle(Color.primary.opacity(0.08))
+                                                : AnyShapeStyle(
+                                                    LinearGradient(
+                                                        colors: [
+                                                            accent.opacity(isLast ? 0.95 : 0.7),
+                                                            accent.opacity(isLast ? 0.6 : 0.35),
+                                                        ],
+                                                        startPoint: .top,
+                                                        endPoint: .bottom
+                                                    )
+                                                )
                                         )
-                                )
-                                .frame(width: barWidth, height: height)
-                            Text(weekday(for: day.date))
-                                .font(.system(size: 7, weight: .medium))
-                                .foregroundStyle(.quaternary)
-                                .frame(height: 7)
+                                        .frame(width: barWidth, height: height)
+                                    Text(weekday(for: day.date))
+                                        .font(.system(size: 7, weight: .medium))
+                                        .foregroundStyle(.quaternary)
+                                        .frame(height: 7)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .help("\(day.date) · \(day.steps) steps")
+                            }
                         }
-                        .frame(maxWidth: .infinity)
-                        .help("\(day.date) · \(day.steps) steps")
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .frame(height: 44)
             }
-            .frame(height: 44)
+
+            // X axis
+            HStack(spacing: 5) {
+                Spacer().frame(width: 16)
+                if let first = days.first, let last = days.last {
+                    Text(axisDate(for: first.date))
+                    Spacer()
+                    Text(axisDate(for: last.date))
+                }
+            }
+            .font(.system(size: 7, weight: .medium))
+            .foregroundStyle(.quaternary)
+        }
+    }
+}
+
+struct LimitRow: View {
+    let window: UsageWindow
+
+    private var barColor: Color {
+        if window.limited || window.percent >= 95 { return .red }
+        if window.percent >= 80 { return .orange }
+        return accent
+    }
+
+    private var clamped: Double {
+        min(max(Double(window.percent), 0), 100)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Text(window.title)
+                    .font(.system(size: 10, weight: .medium))
+                if window.limited {
+                    Text("limit reached")
+                        .font(.system(size: 7.5, weight: .semibold))
+                        .foregroundStyle(.red)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.red.opacity(0.12)))
+                }
+                Spacer(minLength: 4)
+                Text("\(window.percent)%")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(barColor)
+                Text("resets in \(countdown(to: window.resetsAt))")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.07))
+                    Capsule()
+                        .fill(barColor.opacity(0.85))
+                        .frame(width: max(2, geo.size.width * CGFloat(clamped / 100)))
+                }
+            }
+            .frame(height: 4)
         }
     }
 }
@@ -555,14 +775,17 @@ private struct SegmentedControl: View {
                     Text(option.shortLabel)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(active ? Color.primary : Color.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity, minHeight: 20)
+                        // Clear fills are not hit-testable. Define the hit area explicitly
+                        // so the whole segment, not just the label text, responds.
+                        .contentShape(Rectangle())
                         .background(
                             RoundedRectangle(cornerRadius: 5, style: .continuous)
                                 .fill(active ? Color.primary.opacity(0.09) : Color.clear)
                         )
                 }
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
             }
         }
         .padding(2)
@@ -598,44 +821,65 @@ private struct Card<Content: View>: View {
     }
 }
 
-private struct RefreshGlyph: View {
-    let isLoading: Bool
+/// Small icon+label pill. The text states what the button does.
+private struct ActionPill: View {
+    let symbol: String
+    let label: String
+    var tint: Color = .secondary
+    var active = false
+    var help: String? = nil
+    let action: () -> Void
+
+    @State private var hovering = false
 
     var body: some View {
-        Image(systemName: "arrow.clockwise")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(accent)
-            .opacity(isLoading ? 0.3 : 1)
-            .frame(width: 16, height: 16)
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: symbol)
+                    .font(.system(size: 8.5, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 9, weight: .medium))
+                    .lineLimit(1)
+            }
+            .fixedSize()
+            .foregroundStyle(active ? accent : tint)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 3)
+            .frame(minHeight: 20)
             .contentShape(Rectangle())
-            .animation(.easeInOut(duration: 0.15), value: isLoading)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(active || hovering ? Color.primary.opacity(0.08) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .ifLet(help) { view, tip in view.help(tip) }
+    }
+}
+
+extension View {
+    @ViewBuilder
+    func ifLet<T, Transformed: View>(_ value: T?, transform: (Self, T) -> Transformed) -> some View {
+        if let value {
+            transform(self, value)
+        } else {
+            self
+        }
     }
 }
 
 struct MeterView: View {
     @ObservedObject var model: MeterModel
 
-    private var showsCost: Bool {
-        guard let snapshot = model.snapshot else { return false }
-        switch model.displayMode {
-        case .cost: return true
-        case .tokens: return false
-        case .auto: return snapshot.cost > 0
-        }
-    }
-
     private var headline: String {
-        guard let snapshot = model.snapshot else { return "—" }
-        return showsCost ? currency(snapshot.cost) : compact(snapshot.totalTokens)
+        guard let snapshot = model.snapshot else { return "…" }
+        return compact(snapshot.totalTokens)
     }
 
     private var subtitle: String {
         guard let snapshot = model.snapshot else { return model.error ?? "Loading…" }
-        var parts: [String] = [showsCost ? "spent" : "tokens"]
-        if !showsCost || snapshot.cost == 0 {
-            parts.append(currency(snapshot.cost))
-        }
-        parts.append("\(snapshot.sessions) sessions")
+        var parts: [String] = ["tokens", currency(snapshot.cost), "\(snapshot.sessions) sessions"]
         if snapshot.streak > 1 {
             parts.append("\(snapshot.streak)-day streak")
         }
@@ -664,6 +908,9 @@ struct MeterView: View {
     private var dashboard: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
+            if let limits = model.limits, !limits.windows.isEmpty {
+                limitsCard(limits)
+            }
             VStack(alignment: .leading, spacing: 10) {
                 headlineBlock
                 SegmentedControl(selection: $model.period)
@@ -677,78 +924,82 @@ struct MeterView: View {
     // MARK: Header
 
     private var header: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 2) {
             Image(systemName: "chevron.left.forwardslash.chevron.right")
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(accent)
-            Text("OpenCode Meter")
+            Text("OpenCode")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
-            Spacer(minLength: 8)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.leading, 2)
+            Spacer(minLength: 4)
 
-            Button {
+            ActionPill(
+                symbol: "questionmark.circle",
+                label: "Help",
+                help: "Show the welcome screen"
+            ) {
                 model.reopenWelcome()
-            } label: {
-                Image(systemName: "questionmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .help("Show the welcome screen")
 
-            Button {
+            ActionPill(
+                symbol: "menubar.rectangle",
+                label: model.displayMode.shortLabel,
+                active: model.displayMode == .emoji,
+                help: "Change what the menu bar shows"
+            ) {
                 cycleDisplayMode()
-            } label: {
-                Text(displayGlyph)
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .foregroundStyle(model.displayMode == .auto ? Color.secondary : accent)
-                    .frame(width: 16, height: 16)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .fill(Color.primary.opacity(model.displayMode == .auto ? 0.05 : 0.09))
-                    )
             }
-            .buttonStyle(.plain)
-            .help("Menu bar shows: \(model.displayMode.label) — click to switch")
 
-            Button {
+            ActionPill(
+                symbol: "arrow.clockwise",
+                label: "Refresh",
+                tint: model.isLoading ? .secondary.opacity(0.45) : accent,
+                help: "Refresh now"
+            ) {
                 model.refresh()
-            } label: {
-                RefreshGlyph(isLoading: model.isLoading)
             }
-            .buttonStyle(.plain)
-            .help("Refresh now")
 
-            Button {
+            ActionPill(
+                symbol: "power",
+                label: "Quit",
+                tint: .secondary.opacity(0.8),
+                help: "Quit OpenCode Meter"
+            ) {
                 NSApp.terminate(nil)
-            } label: {
-                Image(systemName: "power")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 14, height: 16)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .help("Quit OpenCode Meter")
         }
     }
 
-    private var displayGlyph: String {
-        switch model.displayMode {
-        case .auto: return "A"
-        case .cost: return "$"
-        case .tokens: return "#"
+    private func limitsCard(_ limits: UsageLimits) -> some View {
+        Card {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 4) {
+                    SectionLabel(text: "Limits")
+                    Spacer()
+                    if let url = limits.dashboardURL {
+                        Button {
+                            NSWorkspace.shared.open(url)
+                        } label: {
+                            Text("Open dashboard")
+                                .font(.system(size: 8.5, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open the OpenCode usage dashboard")
+                    }
+                }
+                ForEach(limits.windows) { window in
+                    LimitRow(window: window)
+                }
+            }
         }
     }
 
     private func cycleDisplayMode() {
-        switch model.displayMode {
-        case .auto: model.displayMode = .cost
-        case .cost: model.displayMode = .tokens
-        case .tokens: model.displayMode = .auto
-        }
+        model.displayMode = model.displayMode == .tokens ? .emoji : .tokens
     }
 
     private var headlineBlock: some View {
@@ -804,7 +1055,7 @@ struct MeterView: View {
     }
 
     private func tokenCard(_ snapshot: Snapshot) -> some View {
-        let peak = max(snapshot.input, snapshot.output, snapshot.reasoning, 1)
+        let peak = max(snapshot.input, snapshot.output, snapshot.reasoning, snapshot.cacheTokens, 1)
         return Card {
             VStack(alignment: .leading, spacing: 9) {
                 SectionLabel(text: "Tokens")
@@ -812,13 +1063,7 @@ struct MeterView: View {
                 TokenBar(label: "Output", value: snapshot.output, maxValue: peak)
                 TokenBar(label: "Reasoning", value: snapshot.reasoning, maxValue: peak)
                 if snapshot.cacheTokens > 0 {
-                    HStack(spacing: 4) {
-                        Image(systemName: "bolt.horizontal.circle")
-                            .font(.system(size: 9))
-                        Text("cache \(compact(snapshot.cacheTokens))")
-                            .font(.system(size: 9, weight: .medium))
-                    }
-                    .foregroundStyle(.tertiary)
+                    TokenBar(label: "Cache", value: snapshot.cacheTokens, maxValue: snapshot.cacheTokens)
                 }
             }
         }
@@ -952,7 +1197,6 @@ struct WelcomeView: View {
             status
             if !cliInstalled { installHint }
             cta
-            footnote
         }
         .padding(20)
     }
@@ -980,7 +1224,7 @@ struct WelcomeView: View {
         VStack(spacing: 3) {
             Text("OpenCode Meter")
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
-            Text("Your OpenCode usage, right in the menu bar.")
+            Text("OpenCode usage in your menu bar.")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -991,18 +1235,18 @@ struct WelcomeView: View {
         VStack(alignment: .leading, spacing: 9) {
             FeatureRow(
                 symbol: "chart.bar.fill",
-                title: "Cost and tokens at a glance",
-                detail: "Daily spend, token split, top models and activity."
+                title: "Daily spend and tokens",
+                detail: "Cost, token split, models and activity."
             )
             FeatureRow(
                 symbol: "lock.fill",
-                title: "Reads your Mac, nothing else",
-                detail: "Powered by opencode stats. No account, no API key, no network calls."
+                title: "Local only",
+                detail: "Data comes from opencode stats on this Mac. No account, no API key."
             )
             FeatureRow(
                 symbol: "clock.arrow.circlepath",
-                title: "Always current",
-                detail: "Refreshes every minute and whenever you open it."
+                title: "Auto refresh",
+                detail: "Updates every 60 seconds and when you open it."
             )
         }
     }
@@ -1071,18 +1315,13 @@ struct WelcomeView: View {
         .tint(accent)
         .keyboardShortcut(.defaultAction)
     }
-
-    private var footnote: some View {
-        Text("Everything stays on this Mac.")
-            .font(.system(size: 8.5))
-            .foregroundStyle(.tertiary)
-    }
 }
 
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private var chartImage: NSImage!
     private var popover: NSPopover!
     private var model = MeterModel()
     private var host: NSHostingController<MeterView>!
@@ -1092,9 +1331,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        chartImage = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "OpenCode usage")
+        chartImage?.isTemplate = true
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "OpenCode usage")
-            button.image?.isTemplate = true
+            button.image = chartImage
             button.imagePosition = .imageLeading
             button.target = self
             button.action = #selector(togglePopover)
@@ -1123,19 +1363,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateTitle() {
-        guard statusItem.button != nil else { return }
-        var text = "!"
-        if let snapshot = model.snapshot, model.error == nil {
-            switch model.displayMode {
-            case .cost:
-                text = currency(snapshot.cost)
-            case .tokens:
-                text = compact(snapshot.totalTokens)
-            case .auto:
-                text = snapshot.cost > 0 ? currency(snapshot.cost) : compact(snapshot.totalTokens)
-            }
+        guard let button = statusItem.button else { return }
+        guard let snapshot = model.snapshot, model.error == nil else {
+            button.image = chartImage
+            setTitle("!")
+            return
         }
-        setTitle(text)
+        switch model.displayMode {
+        case .tokens:
+            button.image = chartImage
+            setTitle(compact(snapshot.totalTokens))
+        case .emoji:
+            button.image = nil
+            button.attributedTitle = NSAttributedString(
+                string: "📊",
+                attributes: [.font: NSFont.systemFont(ofSize: 13)]
+            )
+        }
     }
 
     private func setTitle(_ text: String) {
@@ -1186,7 +1430,16 @@ func renderPreview(to path: String) -> Int32 {
         loaded = demo
     }
     if let snapshot = loaded {
-        renderModel.preview(snapshot, period: ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1" ? .month : .week)
+        let limits: UsageLimits? = {
+            guard let binary = findOpenCode(),
+                  case .success(let limits) = fetchLimits(binary: binary) else { return nil }
+            return limits
+        }()
+        renderModel.preview(
+            snapshot,
+            period: ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1" ? .month : .week,
+            limits: limits
+        )
     }
     if ProcessInfo.processInfo.environment["OCMETER_WELCOME"] == "1" {
         renderModel.showWelcome = true
