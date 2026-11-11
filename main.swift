@@ -1321,7 +1321,7 @@ struct WelcomeView: View {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var chartImage: NSImage!
     private var logoImage: NSImage!
@@ -1353,6 +1353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         popover.contentViewController = host
         popover.contentSize = NSSize(width: 336, height: 430)
 
@@ -1400,7 +1401,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func resizePopover() {
         let fitting = host.view.fittingSize
         guard fitting.height > 0 else { return }
-        popover.contentSize = NSSize(width: 336, height: min(max(fitting.height, 260), 620))
+        let available = (NSScreen.main?.visibleFrame.height ?? 900) - 40
+        let height = min(max(fitting.height, 260), max(available, 320))
+        popover.contentSize = NSSize(width: 336, height: height)
+    }
+
+    /// NSPopover grows around the centre of its window when the content gets
+    /// taller, which can push the top edge above the menu bar and hide the
+    /// header. Pin the top edge back under the menu bar after such a resize.
+    @objc private func pinPopoverTop() {
+        guard let screen = NSScreen.main,
+              let window = host.view.window,
+              window.isVisible else { return }
+        var frame = window.frame
+        let top = screen.visibleFrame.maxY
+        guard abs(frame.maxY - top) > 0.5 else { return }
+        frame.origin.y = top - frame.height
+        window.setFrame(frame, display: true)
     }
 
     @objc private func togglePopover() {
@@ -1411,9 +1428,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         model.refresh()
         NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
         resizePopover()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if let window = host.view.window {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(pinPopoverTop),
+                name: NSWindow.didResizeNotification,
+                object: window
+            )
+        }
+        popover.contentViewController?.view.window?.makeKey()
+    }
+}
+
+extension AppDelegate {
+    func popoverDidClose(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didResizeNotification,
+            object: nil
+        )
     }
 }
 
