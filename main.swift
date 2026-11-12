@@ -39,16 +39,45 @@ enum Period: Int, CaseIterable, Hashable {
 // MARK: - Display mode
 
 enum DisplayMode: String, CaseIterable, Hashable {
-    case tokens, logo
+    case tokens, cost, limit, logo
 
     var label: String {
         switch self {
         case .tokens: return "Tokens"
+        case .cost: return "Cost"
+        case .limit: return "Limit"
         case .logo: return "Logo"
         }
     }
 
     var shortLabel: String { label }
+}
+
+enum ChartMetric: String, CaseIterable, Identifiable {
+    case steps, tokens
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .steps: return "Steps"
+        case .tokens: return "Tokens"
+        }
+    }
+}
+
+/// One local day of usage, persisted so the app can show trends without
+/// re-reading the whole OpenCode database.
+struct DayRecord: Codable, Identifiable, Equatable {
+    var date: String
+    var tokens: Int
+    var cost: Double
+    var sessions: Int
+    var prompts: Int
+    var steps: Int
+    var toolCalls: Int
+
+    var id: String { date }
 }
 
 // MARK: - Snapshot
@@ -367,6 +396,14 @@ func countdown(to date: Date) -> String {
 
 // MARK: - Model
 
+func historyFileURL() -> URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+    return base
+        .appendingPathComponent("OpenCodeMeter", isDirectory: true)
+        .appendingPathComponent("history.json")
+}
+
 final class MeterModel: ObservableObject {
     @Published private(set) var snapshot: Snapshot?
     @Published private(set) var limits: UsageLimits?
@@ -381,13 +418,46 @@ final class MeterModel: ObservableObject {
         }
     }
     @Published var displayMode: DisplayMode {
-        didSet { UserDefaults.standard.set(displayMode.rawValue, forKey: "displayMode") }
+        didSet {
+            UserDefaults.standard.set(displayMode.rawValue, forKey: "displayMode")
+            // The status item is painted from `onChange`. Without this the menu
+            // bar kept the old icon until the next stats refresh.
+            onChange?()
+        }
     }
     @Published var showWelcome: Bool
+    @Published var showSettings = false {
+        didSet { DispatchQueue.main.async { [weak self] in self?.onChange?() } }
+    }
+    @Published var refreshSeconds: Int {
+        didSet {
+            defaults.set(refreshSeconds, forKey: "refreshSeconds")
+            if !isPreviewing { scheduleTimer() }
+        }
+    }
+    @Published var monthlyBudget: Double {
+        didSet {
+            guard !isPreviewing else { return }
+            defaults.set(monthlyBudget, forKey: "monthlyBudget")
+            onChange?()
+            if monthlyBudget > 0 { refresh() }
+        }
+    }
+    @Published private(set) var history: [DayRecord] = []
 
     var openCodePath: String? { binary }
 
     var isOnboarded: Bool { defaults.bool(forKey: "hasOnboarded") }
+
+    var monthCost: Double? { snapshotCache[.month]?.cost }
+    var weekCost: Double? { snapshotCache[.week]?.cost }
+
+    /// Projects the last seven days to a 30 day spend. `nil` until the week
+    /// snapshot has arrived, so the budget card can say "on pace" honestly.
+    var projectedMonthlyCost: Double? {
+        guard let weekCost else { return nil }
+        return weekCost / 7 * 30
+    }
 
     var onChange: (() -> Void)?
 
@@ -397,7 +467,15 @@ final class MeterModel: ObservableObject {
     private var snapshotCache: [Period: Snapshot] = [:]
     private var lastLimitsFetch: Date?
     private var isLoadingLimits = false
+    private var timer: Timer?
     private let binary = findOpenCode()
+    private let historyURL = historyFileURL()
+
+    private static let dayKeyFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 
     init() {
         period = Period(rawValue: defaults.object(forKey: "period") as? Int ?? 0) ?? .today
@@ -405,6 +483,9 @@ final class MeterModel: ObservableObject {
         // Earlier builds stored "emoji" for the icon-only mode.
         if defaults.string(forKey: "displayMode") == "emoji" { displayMode = .logo }
         showWelcome = !defaults.bool(forKey: "hasOnboarded")
+        refreshSeconds = defaults.object(forKey: "refreshSeconds") as? Int ?? 60
+        monthlyBudget = defaults.double(forKey: "monthlyBudget")
+        history = Self.loadHistory()
     }
 
     func completeOnboarding() {
@@ -418,8 +499,14 @@ final class MeterModel: ObservableObject {
     }
 
     func start() {
+        scheduleTimer()
         refresh()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+    }
+
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let interval = TimeInterval(max(15, refreshSeconds))
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -439,37 +526,60 @@ final class MeterModel: ObservableObject {
         refreshLimits()
 
         let requested = period
+        var periods: [Period] = [requested, .today, .week]
+        if monthlyBudget > 0 { periods.append(.month) }
+        var seen = Set<Period>()
+        periods = periods.filter { seen.insert($0).inserted }
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            var result = runStats(binary: binary, period: requested)
-            // The activity chart always shows the last seven days, but
-            // `--days 1` only contains today. Pull the week too so Today's
-            // chart does not show six empty days.
-            if requested == .today,
-               case .success(var snapshot) = result,
-               case .success(let week) = runStats(binary: binary, period: .week) {
-                snapshot.activity = week.activity
-                result = .success(snapshot)
+            var results: [Period: Snapshot] = [:]
+            var requestedError: Error?
+            for requestedPeriod in periods {
+                switch runStats(binary: binary, period: requestedPeriod) {
+                case .success(let snapshot):
+                    results[requestedPeriod] = snapshot
+                case .failure(let error):
+                    if requestedPeriod == requested { requestedError = error }
+                }
+            }
+            // `--days 0` only contains today, but the chart always shows a week.
+            if var today = results[.today], let week = results[.week] {
+                today.activity = week.activity
+                results[.today] = today
             }
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.isLoading = false
+                for (period, snapshot) in results {
+                    self.snapshotCache[period] = snapshot
+                }
+                // Every refresh records a local day, so trends keep working
+                // even when the user browses a different period.
+                if let today = results[.today] {
+                    self.record(today)
+                }
+                self.lastUpdate = Date()
+
                 guard requested == self.period else {
-                    self.isLoading = false
+                    if let cached = self.snapshotCache[self.period] {
+                        self.snapshot = cached
+                        self.error = nil
+                    }
                     if self.pendingRefresh {
                         self.pendingRefresh = false
                         self.refresh()
+                    } else {
+                        self.onChange?()
                     }
                     return
                 }
-                self.isLoading = false
-                switch result {
-                case .success(let snapshot):
-                    self.snapshotCache[requested] = snapshot
+
+                if let snapshot = results[requested] {
                     self.snapshot = snapshot
                     self.error = nil
-                case .failure(let error):
-                    self.error = error.localizedDescription
+                } else if let requestedError {
+                    self.error = requestedError.localizedDescription
                 }
-                self.lastUpdate = Date()
                 self.onChange?()
             }
         }
@@ -486,6 +596,60 @@ final class MeterModel: ObservableObject {
         }
         onChange?()
         refresh()
+    }
+
+    // MARK: History
+
+    private static func loadHistory() -> [DayRecord] {
+        guard let data = try? Data(contentsOf: historyFileURL()),
+              var records = try? JSONDecoder().decode([DayRecord].self, from: data) else {
+            return []
+        }
+        records.sort { $0.date < $1.date }
+        if records.count > 180 {
+            records.removeFirst(records.count - 180)
+        }
+        return records
+    }
+
+    private func saveHistory() {
+        do {
+            try FileManager.default.createDirectory(
+                at: historyURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(history)
+            try data.write(to: historyURL, options: .atomic)
+        } catch {}
+    }
+
+    private func record(_ snapshot: Snapshot) {
+        let key = Self.dayKeyFormatter.string(from: Date())
+        let entry = DayRecord(
+            date: key,
+            tokens: snapshot.totalTokens,
+            cost: snapshot.cost,
+            sessions: snapshot.sessions,
+            prompts: snapshot.prompts,
+            steps: snapshot.steps,
+            toolCalls: snapshot.toolCalls
+        )
+        if let index = history.firstIndex(where: { $0.date == key }) {
+            guard history[index] != entry else { return }
+            history[index] = entry
+        } else {
+            history.append(entry)
+            history.sort { $0.date < $1.date }
+            if history.count > 180 {
+                history.removeFirst(history.count - 180)
+            }
+        }
+        saveHistory()
+    }
+
+    func clearHistory() {
+        history = []
+        try? FileManager.default.removeItem(at: historyURL)
     }
 
     func refreshLimits(force: Bool = false) {
@@ -514,9 +678,19 @@ final class MeterModel: ObservableObject {
         self.period = period
         isPreviewing = false
         self.snapshot = snapshot
+        self.snapshotCache[period] = snapshot
         self.error = nil
         self.limits = limits
         self.lastUpdate = Date()
+    }
+
+    /// Seeds the budget card and token chart for the README screenshots.
+    func previewExtras(budget: Double, history records: [DayRecord], week: Snapshot? = nil) {
+        isPreviewing = true
+        history = records
+        monthlyBudget = budget
+        isPreviewing = false
+        if let week { snapshotCache[.week] = week }
     }
 }
 
@@ -567,8 +741,20 @@ struct TokenBar: View {
 
 struct ActivityChart: View {
     let days: [DayActivity]
+    @Binding var metric: ChartMetric
+    let comparison: String?
+    let collectingHistory: Bool
 
-    private var maxSteps: Int { max(days.map(\.steps).max() ?? 0, 1) }
+    private var maxValue: Int { max(days.map(\.steps).max() ?? 0, 1) }
+    private var total: Int { days.map(\.steps).reduce(0, +) }
+
+    private var title: String {
+        metric == .steps ? "Daily steps" : "Daily tokens"
+    }
+
+    private var unit: String {
+        metric == .steps ? "steps" : "tokens"
+    }
 
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -601,17 +787,18 @@ struct ActivityChart: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
-                SectionLabel(text: "Daily steps")
+                SectionLabel(text: title)
                 Spacer()
-                Text("total \(compact(days.map(\.steps).reduce(0, +)))")
+                Text("total \(compact(total))")
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(.quaternary)
+                metricToggle
             }
 
             HStack(spacing: 5) {
                 // Y axis
                 VStack(spacing: 0) {
-                    Text(compact(maxSteps))
+                    Text(compact(maxValue))
                         .font(.system(size: 7, weight: .medium))
                         .foregroundStyle(.quaternary)
                         .frame(height: 7, alignment: .top)
@@ -638,7 +825,7 @@ struct ActivityChart: View {
                         HStack(alignment: .bottom, spacing: gap) {
                             ForEach(Array(visible.enumerated()), id: \.element.id) { index, day in
                                 let isLast = index == visible.count - 1
-                                let ratio = Double(day.steps) / Double(maxSteps)
+                                let ratio = Double(day.steps) / Double(maxValue)
                                 let height = day.steps == 0 ? 2 : max(3, (geo.size.height - 8) * CGFloat(ratio))
                                 VStack(spacing: 3) {
                                     Spacer(minLength: 0)
@@ -664,7 +851,7 @@ struct ActivityChart: View {
                                         .frame(height: 7)
                                 }
                                 .frame(maxWidth: .infinity)
-                                .help("\(day.date) · \(day.steps) steps")
+                                .help("\(day.date) · \(day.steps) \(unit)")
                             }
                         }
                     }
@@ -677,13 +864,54 @@ struct ActivityChart: View {
                 Spacer().frame(width: 16)
                 if let first = days.first, let last = days.last {
                     Text(axisDate(for: first.date))
-                    Spacer()
+                    Spacer(minLength: 4)
+                    if metric == .tokens {
+                        if collectingHistory {
+                            Text("collecting history")
+                                .foregroundStyle(.quaternary)
+                        } else if let comparison {
+                            Text(comparison)
+                        }
+                    }
+                    Spacer(minLength: 4)
                     Text(axisDate(for: last.date))
                 }
             }
             .font(.system(size: 7, weight: .medium))
             .foregroundStyle(.quaternary)
         }
+    }
+
+    private var metricToggle: some View {
+        HStack(spacing: 1) {
+            ForEach(ChartMetric.allCases) { option in
+                metricButton(option)
+            }
+        }
+        .padding(1)
+        .background(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+        )
+    }
+
+    private func metricButton(_ option: ChartMetric) -> some View {
+        let active = option == metric
+        return Button {
+            metric = option
+        } label: {
+            Text(option.label)
+                .font(.system(size: 7.5, weight: .medium))
+                .foregroundStyle(active ? Color.primary : Color.secondary)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(active ? Color.primary.opacity(0.10) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -735,6 +963,54 @@ struct LimitRow: View {
     }
 }
 
+struct BudgetRow: View {
+    let spent: Double
+    let budget: Double
+    let projected: Double?
+
+    private var fraction: Double {
+        guard budget > 0 else { return 0 }
+        return min(max(spent / budget, 0), 1)
+    }
+
+    private var color: Color {
+        if spent > budget { return .red }
+        if let projected, projected > budget { return .orange }
+        return accent
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Text("Budget")
+                    .font(.system(size: 10, weight: .medium))
+                Text("30 days")
+                    .font(.system(size: 7.5))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 4)
+                Text("\(currency(spent)) / \(currency(budget))")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+                if let projected {
+                    Text("on pace \(currency(projected))")
+                        .font(.system(size: 8.5))
+                        .foregroundStyle(projected > budget ? Color.orange : Color.secondary)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.07))
+                    Capsule()
+                        .fill(color.opacity(0.85))
+                        .frame(width: max(2, geo.size.width * CGFloat(fraction)))
+                }
+            }
+            .frame(height: 4)
+        }
+    }
+}
+
 struct ModelRowView: View {
     let row: ModelRow
     let maxTokens: Int
@@ -766,6 +1042,29 @@ struct ModelRowView: View {
                 }
             }
             .frame(height: 3)
+        }
+    }
+}
+
+private struct EmptyModelRow: View {
+    let first: Bool
+    let empty: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(first ? (empty ? "No model activity" : "No other models") : " ")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.quaternary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("—")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.quaternary)
+            }
+            Capsule()
+                .fill(Color.primary.opacity(0.035))
+                .frame(height: 3)
         }
     }
 }
@@ -902,6 +1201,14 @@ extension View {
 
 struct MeterView: View {
     @ObservedObject var model: MeterModel
+    @AppStorage("chartMetric") private var chartMetricRaw = ChartMetric.steps.rawValue
+
+    private var chartMetric: Binding<ChartMetric> {
+        Binding(
+            get: { ChartMetric(rawValue: chartMetricRaw) ?? .steps },
+            set: { chartMetricRaw = $0.rawValue }
+        )
+    }
 
     private var headline: String {
         guard let snapshot = model.snapshot else { return "…" }
@@ -928,6 +1235,8 @@ struct MeterView: View {
         Group {
             if model.showWelcome {
                 WelcomeView(model: model)
+            } else if model.showSettings {
+                SettingsView(model: model)
             } else {
                 dashboard
             }
@@ -939,8 +1248,8 @@ struct MeterView: View {
     private var dashboard: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
-            if let limits = model.limits, !limits.windows.isEmpty {
-                limitsCard(limits)
+            if model.limits?.windows.isEmpty == false || model.monthlyBudget > 0 {
+                limitsCard(model.limits)
             }
             VStack(alignment: .leading, spacing: 10) {
                 headlineBlock
@@ -1004,13 +1313,17 @@ struct MeterView: View {
         }
     }
 
-    private func limitsCard(_ limits: UsageLimits) -> some View {
-        Card {
+    private func limitsCard(_ limits: UsageLimits?) -> some View {
+        let windows = limits?.windows ?? []
+        let label = windows.isEmpty && model.monthlyBudget > 0
+            ? "Budget"
+            : (model.monthlyBudget > 0 ? "Limits & budget" : "Limits")
+        return Card {
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 4) {
-                    SectionLabel(text: "Limits")
+                    SectionLabel(text: label)
                     Spacer()
-                    if let url = limits.dashboardURL {
+                    if let url = limits?.dashboardURL {
                         Button {
                             NSWorkspace.shared.open(url)
                         } label: {
@@ -1022,15 +1335,27 @@ struct MeterView: View {
                         .help("Open the OpenCode usage dashboard")
                     }
                 }
-                ForEach(limits.windows) { window in
+                ForEach(windows) { window in
                     LimitRow(window: window)
+                }
+                if !windows.isEmpty && model.monthlyBudget > 0 {
+                    Divider().opacity(0.5)
+                }
+                if model.monthlyBudget > 0 {
+                    BudgetRow(
+                        spent: model.monthCost ?? 0,
+                        budget: model.monthlyBudget,
+                        projected: model.projectedMonthlyCost
+                    )
                 }
             }
         }
     }
 
     private func cycleDisplayMode() {
-        model.displayMode = model.displayMode == .tokens ? .logo : .tokens
+        let modes = DisplayMode.allCases
+        guard let index = modes.firstIndex(of: model.displayMode) else { return }
+        model.displayMode = modes[(index + 1) % modes.count]
     }
 
     private var headlineBlock: some View {
@@ -1058,7 +1383,12 @@ struct MeterView: View {
                 // Always reserve the chart slot. Hiding it on sparse periods made
                 // the popover change height between Today and 30 days, which read
                 // as the panel opening and closing on every switch.
-                ActivityChart(days: paddedActivity(snapshot))
+                ActivityChart(
+                    days: chartDays(snapshot),
+                    metric: chartMetric,
+                    comparison: tokenComparison,
+                    collectingHistory: model.history.count < 2
+                )
 
                 if !snapshot.models.isEmpty {
                     modelSection(snapshot)
@@ -1104,8 +1434,15 @@ struct MeterView: View {
         let peak = max(snapshot.models.first?.tokens ?? 1, 1)
         return VStack(alignment: .leading, spacing: 9) {
             SectionLabel(text: "Models")
-            ForEach(Array(snapshot.models.prefix(3).enumerated()), id: \.element.id) { _, row in
-                ModelRowView(row: row, maxTokens: peak)
+            // Keep three slots in every period. The number of models returned
+            // depends on the range, and a shorter list used to change the
+            // popover height when switching periods.
+            ForEach(0..<3, id: \.self) { index in
+                if index < snapshot.models.count {
+                    ModelRowView(row: snapshot.models[index], maxTokens: peak)
+                } else {
+                    EmptyModelRow(first: index == 0, empty: snapshot.models.isEmpty)
+                }
             }
         }
         .padding(.horizontal, 2)
@@ -1134,29 +1471,415 @@ struct MeterView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
             Spacer()
+            Button {
+                model.showSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
             Text(model.period.label)
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.tertiary)
         }
     }
 
+    private var chartWindow: Int {
+        switch model.period {
+        case .today, .week: return 7
+        case .month, .all: return 14
+        }
+    }
+
+    private func chartDays(_ snapshot: Snapshot) -> [DayActivity] {
+        chartMetric.wrappedValue == .steps ? paddedActivity(snapshot) : paddedHistory()
+    }
+
     /// Fills days without activity with zeros so the chart has a real time axis.
     private func paddedActivity(_ snapshot: Snapshot) -> [DayActivity] {
         let byDate = Dictionary(snapshot.activity.map { ($0.date, $0.steps) }, uniquingKeysWith: { first, _ in first })
-        let window: Int
-        switch model.period {
-        case .today, .week: window = 7
-        case .month, .all: window = 14
-        }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         var days: [DayActivity] = []
-        for offset in stride(from: window - 1, through: 0, by: -1) {
+        for offset in stride(from: chartWindow - 1, through: 0, by: -1) {
             guard let date = Calendar.current.date(byAdding: .day, value: -offset, to: Date()) else { continue }
             let key = formatter.string(from: date)
             days.append(DayActivity(date: key, steps: byDate[key] ?? 0))
         }
         return days
+    }
+
+    /// Same shape as the steps chart, but from the locally stored daily history.
+    private func paddedHistory() -> [DayActivity] {
+        let byDate = Dictionary(model.history.map { ($0.date, $0.tokens) }, uniquingKeysWith: { first, _ in first })
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        var days: [DayActivity] = []
+        for offset in stride(from: chartWindow - 1, through: 0, by: -1) {
+            guard let date = Calendar.current.date(byAdding: .day, value: -offset, to: Date()) else { continue }
+            let key = formatter.string(from: date)
+            days.append(DayActivity(date: key, steps: byDate[key] ?? 0))
+        }
+        return days
+    }
+
+    /// Compares the last seven recorded days with the seven before them.
+    /// `nil` until there is enough history to make an honest comparison.
+    private var tokenComparison: String? {
+        guard model.history.count >= 8 else { return nil }
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let now = Date()
+
+        func key(_ offset: Int) -> String? {
+            calendar.date(byAdding: .day, value: -offset, to: now).map { formatter.string(from: $0) }
+        }
+        guard let start = key(13), let earliest = model.history.first?.date, earliest <= start else {
+            return nil
+        }
+
+        let byDate = Dictionary(model.history.map { ($0.date, $0.tokens) }, uniquingKeysWith: { first, _ in first })
+        var recent = 0
+        var previous = 0
+        for offset in 0...6 {
+            if let key = key(offset) { recent += byDate[key] ?? 0 }
+        }
+        for offset in 7...13 {
+            if let key = key(offset) { previous += byDate[key] ?? 0 }
+        }
+        guard previous > 0 else { return nil }
+        let change = (Double(recent) - Double(previous)) / Double(previous) * 100
+        return String(format: "%+.0f%% vs prev 7d", change)
+    }
+}
+
+// MARK: - Settings
+
+enum LoginItem {
+    static let plistURL = URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/LaunchAgents/dev.local.opencode-meter.plist")
+
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    @discardableResult
+    static func setEnabled(_ enabled: Bool) -> Bool {
+        guard enabled else {
+            try? FileManager.default.removeItem(at: plistURL)
+            return true
+        }
+        guard let executable = Bundle.main.executableURL?.path else { return false }
+        let escaped = executable
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>dev.local.opencode-meter</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>\(escaped)</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <false/>
+            <key>ProcessType</key>
+            <string>Interactive</string>
+        </dict>
+        </plist>
+        """
+        do {
+            try FileManager.default.createDirectory(
+                at: plistURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+private struct SettingsView: View {
+    @ObservedObject var model: MeterModel
+
+    @State private var budgetText = ""
+    @State private var loginEnabled = LoginItem.isEnabled
+    @State private var loginError: String?
+
+    private let intervals = [30, 60, 120, 300]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            menuBarCard
+            refreshCard
+            budgetCard
+            storageCard
+            footer
+        }
+        .padding(16)
+        .onAppear {
+            budgetText = model.monthlyBudget > 0
+                ? String(format: "%.2f", model.monthlyBudget)
+                : ""
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 2) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(accent)
+            Text("Settings")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+            Spacer(minLength: 4)
+            ActionPill(symbol: "checkmark", label: "Done", tint: accent) {
+                model.showSettings = false
+            }
+        }
+    }
+
+    private var menuBarCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Menu bar")
+                HStack(spacing: 4) {
+                    ForEach(DisplayMode.allCases, id: \.self) { mode in
+                        let active = mode == model.displayMode
+                        Button {
+                            model.displayMode = mode
+                        } label: {
+                            Text(mode.label)
+                                .font(.system(size: 9.5, weight: .medium))
+                                .foregroundStyle(active ? Color.primary : Color.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 20)
+                                .contentShape(Rectangle())
+                                .background(
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .fill(active ? Color.primary.opacity(0.09) : Color.clear)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(2)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                Text("Cost shows spend, Limit shows the tightest quota window.")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var refreshCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Refresh")
+                HStack(spacing: 4) {
+                    Text("Check stats every")
+                        .font(.system(size: 10))
+                    Spacer(minLength: 4)
+                    HStack(spacing: 2) {
+                        ForEach(intervals, id: \.self) { seconds in
+                            let active = model.refreshSeconds == seconds
+                            Button {
+                                model.refreshSeconds = seconds
+                            } label: {
+                                Text(intervalLabel(seconds))
+                                    .font(.system(size: 9.5, weight: .medium))
+                                    .foregroundStyle(active ? Color.primary : Color.secondary)
+                                    .frame(maxWidth: .infinity, minHeight: 20)
+                                    .contentShape(Rectangle())
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .fill(active ? Color.primary.opacity(0.09) : Color.clear)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(2)
+                    .frame(width: 168)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    )
+                }
+                Text("Limits are cached for five minutes.")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var budgetCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Budget")
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("30 day budget")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text("Adds a spend card and a pace estimate.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    HStack(spacing: 2) {
+                        Text("$")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        budgetEditor
+                    }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.primary.opacity(0.06))
+                    )
+                    ActionPill(symbol: "checkmark", label: "Set", tint: accent) {
+                        applyBudget()
+                    }
+                }
+                Text("Leave empty to hide. Pace is the last 7 days projected to 30.")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var storageCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 9) {
+                SectionLabel(text: "Local data")
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("History")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text("\(model.history.count) day\(model.history.count == 1 ? "" : "s") saved on this Mac")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    ActionPill(
+                        symbol: "trash",
+                        label: "Clear",
+                        tint: model.history.isEmpty ? .secondary.opacity(0.45) : .secondary
+                    ) {
+                        model.clearHistory()
+                    }
+                    .disabled(model.history.isEmpty)
+                }
+                Divider().opacity(0.5)
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Start at login")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text(loginError ?? "Adds a LaunchAgent for this copy of the app.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(loginError == nil ? Color.secondary : Color.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    Button {
+                        let next = !loginEnabled
+                        if LoginItem.setEnabled(next) {
+                            loginEnabled = next
+                            loginError = nil
+                        } else {
+                            loginError = "Could not write the LaunchAgent."
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: loginEnabled ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(loginEnabled ? "On" : "Off")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundStyle(loginEnabled ? accent : Color.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(loginEnabled ? accent.opacity(0.12) : Color.primary.opacity(0.05))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(loginEnabled ? "Remove the login item" : "Start OpenCode Meter at login")
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            Text("Stored locally in Application Support")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")")
+                .font(.system(size: 9))
+                .foregroundStyle(.quaternary)
+        }
+    }
+
+    @ViewBuilder
+    private var budgetEditor: some View {
+        if ProcessInfo.processInfo.environment["OCMETER_RENDER"] != nil {
+            // ImageRenderer cannot draw AppKit text fields, so screenshots use
+            // a plain label instead of the live editor.
+            Text(budgetText.isEmpty ? "Off" : budgetText)
+                .font(.system(size: 10, design: .rounded))
+                .foregroundStyle(budgetText.isEmpty ? Color.secondary : Color.primary)
+                .frame(width: 44, alignment: .trailing)
+        } else {
+            TextField("Off", text: $budgetText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 10, design: .rounded))
+                .multilineTextAlignment(.trailing)
+                .frame(width: 44)
+                .onSubmit(applyBudget)
+        }
+    }
+
+    private func intervalLabel(_ seconds: Int) -> String {
+        switch seconds {
+        case 60: return "1m"
+        case 120: return "2m"
+        case 300: return "5m"
+        default: return "\(seconds)s"
+        }
+    }
+
+    private func applyBudget() {
+        let cleaned = budgetText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: ",", with: ".")
+        let value = max(0, Double(cleaned) ?? 0)
+        model.monthlyBudget = value
+        budgetText = value > 0 ? String(format: "%.2f", value) : ""
     }
 }
 
@@ -1410,20 +2133,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         switch model.displayMode {
         case .tokens:
-            button.attributedTitle = NSAttributedString(string: "")
             button.image = chartImage
             setTitle(compact(snapshot.totalTokens))
+        case .cost:
+            button.image = chartImage
+            setTitle(currency(snapshot.cost))
+        case .limit:
+            button.image = chartImage
+            let tightest = (model.limits?.windows ?? []).max { $0.percent < $1.percent }
+            guard let tightest else {
+                setTitle("–")
+                return
+            }
+            let color: NSColor? = tightest.limited || tightest.percent >= 95
+                ? .systemRed
+                : (tightest.percent >= 80 ? .systemOrange : nil)
+            setTitle("\(tightest.percent)%", color: color)
         case .logo:
-            button.attributedTitle = NSAttributedString(string: "")
             button.image = logoImage
+            button.attributedTitle = NSAttributedString(string: "")
         }
     }
 
-    private func setTitle(_ text: String) {
+    private func setTitle(_ text: String, color: NSColor? = nil) {
         guard let button = statusItem.button else { return }
-        let attributes: [NSAttributedString.Key: Any] = [
+        var attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
         ]
+        if let color {
+            attributes[.foregroundColor] = color
+        }
         button.attributedTitle = NSAttributedString(string: " " + text, attributes: attributes)
     }
 
@@ -1522,6 +2261,26 @@ func demoSnapshot() -> Snapshot {
     return snapshot
 }
 
+func demoHistory() -> [DayRecord] {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    let pattern = [1420, 960, 180, 2300, 1740, 3550, 2610, 1880, 1120, 3430, 1990, 570, 2200, 1310]
+    return (0..<14).compactMap { offset in
+        guard let date = Calendar.current.date(byAdding: .day, value: offset - 13, to: Date()) else {
+            return nil
+        }
+        return DayRecord(
+            date: formatter.string(from: date),
+            tokens: pattern[offset] * 600,
+            cost: Double(pattern[offset]) * 0.00069,
+            sessions: pattern[offset] / 80,
+            prompts: pattern[offset] / 12,
+            steps: pattern[offset] / 9,
+            toolCalls: pattern[offset] / 11
+        )
+    }
+}
+
 func demoLimits() -> UsageLimits {
     let now = Date()
     return UsageLimits(
@@ -1541,7 +2300,12 @@ func demoLimits() -> UsageLimits {
 func renderPreview(to path: String) -> Int32 {
     let renderModel = MeterModel()
     if ProcessInfo.processInfo.environment["OCMETER_DEMO"] == "1" {
-        renderModel.preview(demoSnapshot(), period: .month, limits: demoLimits())
+        let snapshot = demoSnapshot()
+        renderModel.displayMode = .tokens
+        renderModel.preview(snapshot, period: .month, limits: demoLimits())
+        var week = snapshot
+        week.cost = 4.90
+        renderModel.previewExtras(budget: 25, history: demoHistory(), week: week)
     } else if let binary = findOpenCode(),
               case .success(let snapshot) = runStats(binary: binary, period: .week) {
         let limits: UsageLimits? = {
@@ -1552,8 +2316,10 @@ func renderPreview(to path: String) -> Int32 {
     }
     if ProcessInfo.processInfo.environment["OCMETER_WELCOME"] == "1" {
         renderModel.showWelcome = true
+        renderModel.showSettings = false
     } else {
         renderModel.showWelcome = false
+        renderModel.showSettings = ProcessInfo.processInfo.environment["OCMETER_SETTINGS"] == "1"
     }
     let renderer = ImageRenderer(
         content: MeterView(model: renderModel)
