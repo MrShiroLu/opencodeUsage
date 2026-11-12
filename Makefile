@@ -19,6 +19,7 @@ install: build
 uninstall:
 	pkill -f "Applications/OpenCodeMeter.app" || true
 	rm -rf $(TARGET)
+	rm -f $(HOME)/Library/LaunchAgents/dev.local.opencode-meter.plist
 	@echo "Removed $(TARGET)"
 
 print: build
@@ -27,6 +28,7 @@ print: build
 render: build
 	OCMETER_DEMO=1 OCMETER_RENDER=docs/preview.png $(BIN)
 	OCMETER_DEMO=1 OCMETER_RENDER=docs/welcome.png OCMETER_WELCOME=1 $(BIN)
+	OCMETER_DEMO=1 OCMETER_RENDER=docs/settings.png OCMETER_SETTINGS=1 $(BIN)
 
 icon: build
 	swiftc -O -o build/make-icon Support/make-icon.swift
