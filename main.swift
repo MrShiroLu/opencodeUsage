@@ -2366,7 +2366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNU
     private var model = MeterModel()
     private var host: NSHostingController<MeterView>!
     private var cancellables = Set<AnyCancellable>()
-    private var pendingTitleUpdate = false
+    private var popoverAnchorX: CGFloat?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2414,15 +2414,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNU
         setTitle("…")
     }
 
-    private func updateTitle(force: Bool = false) {
-        // Changing the title changes the status item width, and the popover is
-        // anchored to that item. Repainting while the popover is open made the
-        // window slide sideways, so defer it until the popover closes.
-        if !force, popover?.isShown == true {
-            pendingTitleUpdate = true
-            return
-        }
+    private func updateTitle() {
         guard let button = statusItem.button else { return }
+        // A new title changes the width of the status item, and the popover is
+        // anchored to that item, so AppKit slides the window sideways while the
+        // mode is picked. Repaint right away and put the window back where it
+        // was, so the menu bar never looks stuck behind the open panel.
+        let pinnedOrigin = popover?.isShown == true ? host.view.window?.frame.origin : nil
+        defer {
+            if let pinnedOrigin {
+                host.view.window?.setFrameOrigin(pinnedOrigin)
+            }
+        }
         guard let snapshot = model.snapshot, model.error == nil else {
             button.image = chartImage
             setTitle("!")
@@ -2477,15 +2480,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNU
     /// NSPopover grows around the centre of its window when the content gets
     /// taller, which can push the top edge above the menu bar and hide the
     /// header. Pin the top edge back under the menu bar after such a resize.
+    /// Its x is pinned too: the window is anchored to the status item, and a
+    /// title change or a resize both made it drift sideways.
     @objc private func pinPopoverTop() {
         guard let screen = NSScreen.main,
               let window = host.view.window,
               window.isVisible else { return }
         var frame = window.frame
+        var changed = false
         let top = screen.visibleFrame.maxY
-        guard abs(frame.maxY - top) > 0.5 else { return }
-        frame.origin.y = top - frame.height
-        window.setFrame(frame, display: true)
+        if abs(frame.maxY - top) > 0.5 {
+            frame.origin.y = top - frame.height
+            changed = true
+        }
+        if let anchorX = popoverAnchorX, abs(frame.origin.x - anchorX) > 0.5 {
+            frame.origin.x = anchorX
+            changed = true
+        }
+        if changed {
+            window.setFrame(frame, display: true)
+        }
     }
 
     @objc private func togglePopover() {
@@ -2511,6 +2525,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNU
 }
 
 extension AppDelegate {
+    func popoverDidShow(_ notification: Notification) {
+        popoverAnchorX = host.view.window?.frame.origin.x
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -2520,15 +2538,12 @@ extension AppDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        popoverAnchorX = nil
         NotificationCenter.default.removeObserver(
             self,
             name: NSWindow.didResizeNotification,
             object: nil
         )
-        if pendingTitleUpdate {
-            pendingTitleUpdate = false
-            updateTitle(force: true)
-        }
     }
 }
 
