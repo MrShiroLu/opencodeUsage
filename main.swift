@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UserNotifications
 
 // MARK: - Period
 
@@ -174,10 +175,14 @@ func findOpenCode() -> String? {
     return nil
 }
 
-func runStats(binary: String, period: Period) -> Result<Snapshot, Error> {
+func runStats(binary: String, period: Period, projectPath: String? = nil) -> Result<Snapshot, Error> {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: binary)
     process.arguments = ["stats"] + period.arguments() + ["--cost", "--json"]
+    if let projectPath, !projectPath.isEmpty {
+        process.arguments?.append(contentsOf: ["--project", "."])
+        process.currentDirectoryURL = URL(fileURLWithPath: projectPath, isDirectory: true)
+    }
 
     var environment = ProcessInfo.processInfo.environment
     let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
@@ -346,6 +351,83 @@ func fetchLimits(binary: String) -> Result<UsageLimits, Error> {
     return .success(limits)
 }
 
+// MARK: - Limit alerts
+
+struct LimitAlert {
+    let identifier: String
+    let title: String
+    let body: String
+}
+
+/// Pure threshold logic so it can be tested without asking for notification
+/// permission. State is per window and keyed by reset time + level, which keeps
+/// one alert per window per threshold per reset instead of one per refresh.
+enum LimitAlertPlanner {
+    static func plan(windows: [UsageWindow], stored: [String: String]) -> (alerts: [LimitAlert], state: [String: String]) {
+        var state = stored
+        var alerts: [LimitAlert] = []
+        for window in windows {
+            let reset = String(Int(window.resetsAt.timeIntervalSince1970))
+            let level: Int
+            if window.limited || window.percent >= 95 {
+                level = 2
+            } else if window.percent >= 80 {
+                level = 1
+            } else {
+                level = 0
+            }
+            let key = "\(reset)|\(level)"
+            let previousLevel: Int? = {
+                guard let previous = stored[window.id] else { return nil }
+                let parts = previous.split(separator: "|")
+                guard parts.count == 2, String(parts[0]) == reset else { return nil }
+                return Int(parts[1])
+            }()
+            state[window.id] = key
+            guard level > 0, (previousLevel ?? 0) < level else { continue }
+
+            let title: String
+            let body: String
+            if level == 2 {
+                title = window.limited ? "\(window.title) limit reached" : "\(window.title) at \(window.percent)%"
+                body = window.limited
+                    ? "The \(window.title) window is limited. It resets in \(countdown(to: window.resetsAt))."
+                    : "\(window.percent)% of the \(window.title) window is used. It resets in \(countdown(to: window.resetsAt))."
+            } else {
+                title = "\(window.title) at \(window.percent)%"
+                body = "You are close to the \(window.title) limit. It resets in \(countdown(to: window.resetsAt))."
+            }
+            alerts.append(
+                LimitAlert(
+                    identifier: "limit-\(window.id)-\(reset)-\(level)",
+                    title: title,
+                    body: body
+                )
+            )
+        }
+        return (alerts, state)
+    }
+}
+
+enum LimitNotifier {
+    static func requestAuthorization(completion: @escaping (Bool) -> Void) {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            DispatchQueue.main.async { completion(granted) }
+        }
+    }
+
+    static func send(_ alerts: [LimitAlert]) {
+        let center = UNUserNotificationCenter.current()
+        for alert in alerts {
+            let content = UNMutableNotificationContent()
+            content.title = alert.title
+            content.body = alert.body
+            content.sound = .default
+            center.add(UNNotificationRequest(identifier: alert.identifier, content: content, trigger: nil))
+        }
+    }
+}
+
 func int(_ value: Any?) -> Int {
     if let n = value as? NSNumber { return n.intValue }
     if let s = value as? String, let n = Int(s) { return n }
@@ -420,9 +502,9 @@ final class MeterModel: ObservableObject {
     @Published var displayMode: DisplayMode {
         didSet {
             UserDefaults.standard.set(displayMode.rawValue, forKey: "displayMode")
-            // The status item is painted from `onChange`. Without this the menu
-            // bar kept the old icon until the next stats refresh.
-            onChange?()
+            // Only repaint the status item. Resizing the popover on a mode
+            // change moved the window because the status item width changed.
+            onTitleChange?()
         }
     }
     @Published var showWelcome: Bool
@@ -443,11 +525,38 @@ final class MeterModel: ObservableObject {
             if monthlyBudget > 0 { refresh() }
         }
     }
+    @Published var limitNotifications: Bool {
+        didSet {
+            guard !isPreviewing else { return }
+            defaults.set(limitNotifications, forKey: "limitNotifications")
+            if limitNotifications { checkLimitAlertsNow() }
+        }
+    }
+    @Published var projectPath: String {
+        didSet {
+            guard !isPreviewing, oldValue != projectPath else { return }
+            defaults.set(projectPath, forKey: "projectPath")
+            reloadHistory()
+            snapshotCache.removeAll()
+            snapshot = nil
+            error = nil
+            onChange?()
+            refresh()
+        }
+    }
     @Published private(set) var history: [DayRecord] = []
 
     var openCodePath: String? { binary }
 
     var isOnboarded: Bool { defaults.bool(forKey: "hasOnboarded") }
+
+    var historyScope: String {
+        projectPath.isEmpty ? "all" : "project:" + projectPath
+    }
+
+    var hasAnyHistory: Bool {
+        histories.contains { !$0.value.isEmpty }
+    }
 
     var monthCost: Double? { snapshotCache[.month]?.cost }
     var weekCost: Double? { snapshotCache[.week]?.cost }
@@ -460,11 +569,13 @@ final class MeterModel: ObservableObject {
     }
 
     var onChange: (() -> Void)?
+    var onTitleChange: (() -> Void)?
 
     private let defaults = UserDefaults.standard
     private var pendingRefresh = false
     private var isPreviewing = false
     private var snapshotCache: [Period: Snapshot] = [:]
+    private var histories: [String: [DayRecord]] = [:]
     private var lastLimitsFetch: Date?
     private var isLoadingLimits = false
     private var timer: Timer?
@@ -485,7 +596,12 @@ final class MeterModel: ObservableObject {
         showWelcome = !defaults.bool(forKey: "hasOnboarded")
         refreshSeconds = defaults.object(forKey: "refreshSeconds") as? Int ?? 60
         monthlyBudget = defaults.double(forKey: "monthlyBudget")
-        history = Self.loadHistory()
+        limitNotifications = defaults.bool(forKey: "limitNotifications")
+        let savedProject = defaults.string(forKey: "projectPath") ?? ""
+        projectPath = savedProject
+        let savedHistories = Self.loadHistories()
+        histories = savedHistories
+        history = savedHistories[savedProject.isEmpty ? "all" : "project:" + savedProject] ?? []
     }
 
     func completeOnboarding() {
@@ -526,6 +642,8 @@ final class MeterModel: ObservableObject {
         refreshLimits()
 
         let requested = period
+        let requestedProject = projectPath
+        let projectFilter: String? = projectPath.isEmpty ? nil : projectPath
         var periods: [Period] = [requested, .today, .week]
         if monthlyBudget > 0 { periods.append(.month) }
         var seen = Set<Period>()
@@ -535,7 +653,7 @@ final class MeterModel: ObservableObject {
             var results: [Period: Snapshot] = [:]
             var requestedError: Error?
             for requestedPeriod in periods {
-                switch runStats(binary: binary, period: requestedPeriod) {
+                switch runStats(binary: binary, period: requestedPeriod, projectPath: projectFilter) {
                 case .success(let snapshot):
                     results[requestedPeriod] = snapshot
                 case .failure(let error):
@@ -550,6 +668,17 @@ final class MeterModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isLoading = false
+                // Drop results from a period or project that changed while the
+                // CLI calls were running.
+                guard requested == self.period, requestedProject == self.projectPath else {
+                    if self.pendingRefresh {
+                        self.pendingRefresh = false
+                        self.refresh()
+                    } else {
+                        self.onChange?()
+                    }
+                    return
+                }
                 for (period, snapshot) in results {
                     self.snapshotCache[period] = snapshot
                 }
@@ -559,20 +688,6 @@ final class MeterModel: ObservableObject {
                     self.record(today)
                 }
                 self.lastUpdate = Date()
-
-                guard requested == self.period else {
-                    if let cached = self.snapshotCache[self.period] {
-                        self.snapshot = cached
-                        self.error = nil
-                    }
-                    if self.pendingRefresh {
-                        self.pendingRefresh = false
-                        self.refresh()
-                    } else {
-                        self.onChange?()
-                    }
-                    return
-                }
 
                 if let snapshot = results[requested] {
                     self.snapshot = snapshot
@@ -600,30 +715,47 @@ final class MeterModel: ObservableObject {
 
     // MARK: History
 
-    private static func loadHistory() -> [DayRecord] {
-        guard let data = try? Data(contentsOf: historyFileURL()),
-              var records = try? JSONDecoder().decode([DayRecord].self, from: data) else {
-            return []
+    private static func loadHistories() -> [String: [DayRecord]] {
+        guard let data = try? Data(contentsOf: historyFileURL()) else { return [:] }
+        if var scopes = try? JSONDecoder().decode([String: [DayRecord]].self, from: data) {
+            for (scope, records) in scopes {
+                var sorted = records.sorted { $0.date < $1.date }
+                if sorted.count > 180 {
+                    sorted.removeFirst(sorted.count - 180)
+                }
+                scopes[scope] = sorted
+            }
+            return scopes
         }
-        records.sort { $0.date < $1.date }
-        if records.count > 180 {
-            records.removeFirst(records.count - 180)
+        // The first history format stored a single array for all projects.
+        if var records = try? JSONDecoder().decode([DayRecord].self, from: data) {
+            records.sort { $0.date < $1.date }
+            if records.count > 180 {
+                records.removeFirst(records.count - 180)
+            }
+            return ["all": records]
         }
-        return records
+        return [:]
     }
 
-    private func saveHistory() {
+    private func saveHistories() {
         do {
             try FileManager.default.createDirectory(
                 at: historyURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let data = try JSONEncoder().encode(history)
+            let data = try JSONEncoder().encode(histories)
             try data.write(to: historyURL, options: .atomic)
         } catch {}
     }
 
+    private func reloadHistory() {
+        history = histories[historyScope] ?? []
+    }
+
     private func record(_ snapshot: Snapshot) {
+        let scope = historyScope
+        var records = histories[scope] ?? []
         let key = Self.dayKeyFormatter.string(from: Date())
         let entry = DayRecord(
             date: key,
@@ -634,22 +766,45 @@ final class MeterModel: ObservableObject {
             steps: snapshot.steps,
             toolCalls: snapshot.toolCalls
         )
-        if let index = history.firstIndex(where: { $0.date == key }) {
-            guard history[index] != entry else { return }
-            history[index] = entry
+        if let index = records.firstIndex(where: { $0.date == key }) {
+            guard records[index] != entry else { return }
+            records[index] = entry
         } else {
-            history.append(entry)
-            history.sort { $0.date < $1.date }
-            if history.count > 180 {
-                history.removeFirst(history.count - 180)
+            records.append(entry)
+            records.sort { $0.date < $1.date }
+            if records.count > 180 {
+                records.removeFirst(records.count - 180)
             }
         }
-        saveHistory()
+        histories[scope] = records
+        history = records
+        saveHistories()
     }
 
     func clearHistory() {
+        histories = [:]
         history = []
         try? FileManager.default.removeItem(at: historyURL)
+    }
+
+    // MARK: Limit alerts
+
+    func checkLimitAlertsNow() {
+        if let limits {
+            updateLimitAlerts(limits)
+        }
+    }
+
+    private func updateLimitAlerts(_ limits: UsageLimits) {
+        guard limitNotifications else { return }
+        let stored = defaults.dictionary(forKey: "limitAlertState") as? [String: String] ?? [:]
+        let plan = LimitAlertPlanner.plan(windows: limits.windows, stored: stored)
+        if plan.state != stored {
+            defaults.set(plan.state, forKey: "limitAlertState")
+        }
+        if !plan.alerts.isEmpty {
+            LimitNotifier.send(plan.alerts)
+        }
     }
 
     func refreshLimits(force: Bool = false) {
@@ -666,6 +821,7 @@ final class MeterModel: ObservableObject {
                 self.lastLimitsFetch = Date()
                 if case .success(let limits) = result, !limits.windows.isEmpty {
                     self.limits = limits
+                    self.updateLimitAlerts(limits)
                 }
                 self.onChange?()
             }
@@ -1617,6 +1773,8 @@ private struct SettingsView: View {
     @State private var budgetText = ""
     @State private var loginEnabled = LoginItem.isEnabled
     @State private var loginError: String?
+    @State private var notificationError: String?
+    @State private var requestingNotifications = false
 
     private let intervals = [30, 60, 120, 300]
 
@@ -1625,7 +1783,9 @@ private struct SettingsView: View {
             header
             menuBarCard
             refreshCard
+            projectCard
             budgetCard
+            alertsCard
             storageCard
             footer
         }
@@ -1768,6 +1928,93 @@ private struct SettingsView: View {
         }
     }
 
+    private var projectCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Project")
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.projectPath.isEmpty
+                             ? "All projects"
+                             : URL(fileURLWithPath: model.projectPath).lastPathComponent)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(model.projectPath.isEmpty
+                             ? "Stats and trends cover every project."
+                             : model.projectPath)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    ActionPill(symbol: "folder", label: "Choose", tint: accent) {
+                        chooseProject()
+                    }
+                    if !model.projectPath.isEmpty {
+                        ActionPill(symbol: "xmark", label: "All") {
+                            model.projectPath = ""
+                        }
+                    }
+                }
+                Text("Runs opencode stats --project . inside the folder. History follows the selection; limits stay account-wide.")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var alertsCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Alerts")
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Limit alerts")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text(notificationError ?? "Notify at 80% and 95% of a quota window.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(notificationError == nil ? Color.secondary : Color.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    if requestingNotifications {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.7)
+                    } else {
+                        Button {
+                            toggleNotifications()
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: model.limitNotifications ? "bell.fill" : "bell.slash")
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text(model.limitNotifications ? "On" : "Off")
+                                    .font(.system(size: 9.5, weight: .medium))
+                            }
+                            .foregroundStyle(model.limitNotifications ? accent : Color.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                            .background(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .fill(model.limitNotifications ? accent.opacity(0.12) : Color.primary.opacity(0.05))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help(model.limitNotifications ? "Turn off limit alerts" : "Turn on limit alerts")
+                    }
+                }
+                Text("Local notifications only. Permission can be changed in System Settings.")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private var storageCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 9) {
@@ -1776,19 +2023,20 @@ private struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("History")
                             .font(.system(size: 10.5, weight: .semibold))
-                        Text("\(model.history.count) day\(model.history.count == 1 ? "" : "s") saved on this Mac")
+                        Text("\(model.history.count) day\(model.history.count == 1 ? "" : "s") saved for this selection")
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 4)
                     ActionPill(
                         symbol: "trash",
-                        label: "Clear",
-                        tint: model.history.isEmpty ? .secondary.opacity(0.45) : .secondary
+                        label: "Clear all",
+                        tint: model.hasAnyHistory ? .secondary : .secondary.opacity(0.45)
                     ) {
                         model.clearHistory()
                     }
-                    .disabled(model.history.isEmpty)
+                    .disabled(!model.hasAnyHistory)
+                    .help("Clear history for every project")
                 }
                 Divider().opacity(0.5)
                 HStack(spacing: 6) {
@@ -1860,6 +2108,43 @@ private struct SettingsView: View {
                 .multilineTextAlignment(.trailing)
                 .frame(width: 44)
                 .onSubmit(applyBudget)
+        }
+    }
+
+    private func chooseProject() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Use Folder"
+        panel.message = "Pick the folder of an OpenCode project."
+        if !model.projectPath.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: model.projectPath, isDirectory: true)
+        }
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            DispatchQueue.main.async {
+                model.projectPath = url.resolvingSymlinksInPath().path
+            }
+        }
+    }
+
+    private func toggleNotifications() {
+        if model.limitNotifications {
+            model.limitNotifications = false
+            notificationError = nil
+            return
+        }
+        notificationError = nil
+        requestingNotifications = true
+        LimitNotifier.requestAuthorization { granted in
+            requestingNotifications = false
+            if granted {
+                model.limitNotifications = true
+            } else {
+                notificationError = "Notifications are disabled in System Settings."
+            }
         }
     }
 
@@ -2073,7 +2358,7 @@ struct WelcomeView: View {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private var chartImage: NSImage!
     private var logoImage: NSImage!
@@ -2081,9 +2366,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var model = MeterModel()
     private var host: NSHostingController<MeterView>!
     private var cancellables = Set<AnyCancellable>()
+    private var pendingTitleUpdate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().delegate = self
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         chartImage = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "OpenCode usage")
@@ -2113,6 +2400,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.updateTitle()
             self?.resizePopover()
         }
+        model.onTitleChange = { [weak self] in
+            self?.updateTitle()
+        }
         model.$showWelcome
             .dropFirst()
             .sink { [weak self] _ in
@@ -2124,7 +2414,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setTitle("…")
     }
 
-    private func updateTitle() {
+    private func updateTitle(force: Bool = false) {
+        // Changing the title changes the status item width, and the popover is
+        // anchored to that item. Repainting while the popover is open made the
+        // window slide sideways, so defer it until the popover closes.
+        if !force, popover?.isShown == true {
+            pendingTitleUpdate = true
+            return
+        }
         guard let button = statusItem.button else { return }
         guard let snapshot = model.snapshot, model.error == nil else {
             button.image = chartImage
@@ -2214,12 +2511,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 }
 
 extension AppDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
     func popoverDidClose(_ notification: Notification) {
         NotificationCenter.default.removeObserver(
             self,
             name: NSWindow.didResizeNotification,
             object: nil
         )
+        if pendingTitleUpdate {
+            pendingTitleUpdate = false
+            updateTitle(force: true)
+        }
     }
 }
 
@@ -2354,9 +2663,11 @@ if ProcessInfo.processInfo.environment["OCMETER_PRINT"] == "1" {
         print("opencode not found")
         exit(1)
     }
-    switch runStats(binary: binary, period: .today) {
+    let project = ProcessInfo.processInfo.environment["OCMETER_PROJECT"]
+    switch runStats(binary: binary, period: .today, projectPath: project) {
     case .success(let snapshot):
-        print("cost=\(currency(snapshot.cost)) tokens=\(compact(snapshot.totalTokens)) sessions=\(snapshot.sessions) models=\(snapshot.models.count)")
+        let scope = project.map { " project=\($0)" } ?? ""
+        print("cost=\(currency(snapshot.cost)) tokens=\(compact(snapshot.totalTokens)) sessions=\(snapshot.sessions) models=\(snapshot.models.count)\(scope)")
     case .failure(let error):
         print("error: \(error.localizedDescription)")
         exit(1)
